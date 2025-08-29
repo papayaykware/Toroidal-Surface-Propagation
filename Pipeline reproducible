@@ -1,0 +1,311 @@
+"""
+Apéndice metodológico — Pipeline reproducible
+Objetivo: proporcionar un pseudocódigo y un pipeline reproducible, listo para transformarse en notebook o script, que permita procesar datos Swarm + observatorios (INTERMAGNET) y buscar firmas interanuales / pluri-anuales atribuibles a modos toroidales internos.
+
+Estructura del documento:
+ 0) Resumen rápido de pasos
+ 1) Dependencias y entorno
+ 2) Organización de datos y metadatos
+ 3) Descarga de datos (Swarm via VirES + INTERMAGNET)
+ 4) Construcción de GVO (opcional: magpysv)
+ 5) Preprocesado y limpieza
+ 6) Filtrado banda y descomposición modal (SSA/EMD)
+ 7) Coherencia espacial y cálculo de SNR
+ 8) Bootstrap y pruebas de significación
+ 9) Inversión forward 1D (estimación de amplitud núcleo->superficie)
+10) Integración con MT y validación multimodal
+11) Salida, reproducibilidad y control de versiones
+
+Nota: este apéndice está escrito como pseudocódigo Python y bloques de comandos shell que debes adaptar a tu entorno.
+
+---------------------------------------------------------------
+0) Resumen rápido de pasos
+---------------------------------------------------------------
+- Preparar entorno Conda/Python con librerías (viresclient, pandas, numpy, scipy, obspy, magpysv, pyssa, pyEMD, matplotlib).
+- Descargar Swarm L1b/L2 y series INTERMAGNET para periodo de interés.
+- Construir GVOs mensuales/4M con ventana deslizante.
+- Filtrar en bandpass (ej. 2-10 yr) y aplicar SSA para separar modos.
+- Calcular coherencia entre nodos; estimar SNR.
+- Bootstrap con ruido 1/f para significación.
+- Realizar forward simple con modelo 1D de conductividad para verificar plausibilidad de amplitud núcleo->superficie.
+- Registrar todo en repo Git con metadata y versiones de producto.
+
+---------------------------------------------------------------
+1) Dependencias y entorno
+---------------------------------------------------------------
+# Crear entorno (ejemplo con conda)
+# conda create -n geomag python=3.10 -y
+# conda activate geomag
+# pip install viresclient pandas numpy scipy matplotlib obspy pyproj pyssa pyemd magpysv netcdf4 xarray joblib
+
+Dependencias críticas:
+- viresclient: descarga Swarm via VirES
+- pandas, xarray, numpy: manipulación de series
+- scipy.signal: filtros, welch, coherencia
+- pyssa / pyEMD: descomposición (SSA o EMD)
+- magpysv: construcción de GVO (opcional)
+- obspy: manipulación de series temporales y operaciones numéricas
+- matplotlib: visualización
+- joblib: paralelización
+
+---------------------------------------------------------------
+2) Organización de datos y metadatos
+---------------------------------------------------------------
+Estructura sugerida de directorios:
+./project_name/
+  data/
+    raw/
+      swarm/
+      intermagnet/
+      mt/
+    processed/
+      gvo/
+      filtered/
+  notebooks/
+  scripts/
+  results/
+  env.yml
+  README.md
+  metadata/
+    data_manifest.yaml
+
+Mantener un manifest YAML con: fuente, producto (L1b/L2), versión, time-range, query params, checksum.
+
+---------------------------------------------------------------
+3) Descarga de datos (Swarm + INTERMAGNET)
+---------------------------------------------------------------
+# Pseudocódigo para Swarm (viresclient)
+from viresclient import SwarmRequest
+import pandas as pd
+
+# parámetros de ejemplo
+start = '2014-01-01'
+end = '2024-12-31'
+collection = 'SW_OPER_MAGA_LR_1B'  # ejemplo, adaptar según necesidades
+products = ['vector_X','vector_Y','vector_Z']
+
+client = SwarmRequest()
+client.set_collection(collection)
+client.set_products(products)
+client.set_time(start, end)
+client.set_geographical(-180, -90, 180, 90)
+client.execute()
+df_swarm = client.to_pandas()
+df_swarm.to_parquet('data/raw/swarm/swarm_maga.parquet')
+
+# INTERMAGNET: descarga por estación (ejemplo sencillo)
+# Usar portal BGS/NOAA o mirrors; aquí pseudocódigo conceptual
+import requests
+station = 'HER'  # código estación
+url = f'https://www.intermagnet.org/data/{station}/...'
+# realizar request y guardar en data/raw/intermagnet/
+
+Guardar metadatos en metadata/data_manifest.yaml con query y checksums.
+
+---------------------------------------------------------------
+4) Construcción de GVO
+---------------------------------------------------------------
+# Opcional: usar magpysv o construir GVOs propio
+# Idea: agrupar pasadas satélite por ventana temporal (p.ej. 4 meses) y estimar campo SV/GVO por minimización
+from magpysv import GvoBuilder
+
+gvo_builder = GvoBuilder(swarm_dataframe=df_swarm, obs_dataframe=df_obs)
+gvo_builder.set_window('4M')
+gvo_builder.run()
+gvo_df = gvo_builder.to_dataframe()
+gvo_df.to_parquet('data/processed/gvo/gvo_4M.parquet')
+
+Si no usas magpysv, construir GVOs con combinación espacial (inversión local) y regularización (spherical cap, Slepian).
+
+---------------------------------------------------------------
+5) Preprocesado y limpieza
+---------------------------------------------------------------
+Funciones principales:
+- eliminar pasadas afectadas por tormentas geomagnéticas (Kp,K,AE thresholds)
+- remplazar saltos instrumentales (detectar con derivative thresholds)
+- gap-fill breve (p.ej. interpolación spline) — evitar interpolar grandes huecos
+- convertir unidades (mantener nT)
+
+# pseudocódigo
+import numpy as np
+
+def mask_geomagnetic_storms(df, kp_series, kp_thresh=4):
+    # crear mask temporal de eventos con kp>kp_thresh
+    return df[~kp_mask]
+
+# Aplicar detrend / baseline correction suave
+from scipy.signal import detrend
+
+def remove_trend(series):
+    return detrend(series)
+
+# Guardar series preprocessed
+preprocessed_df.to_parquet('data/processed/preprocessed/station_X.parquet')
+
+---------------------------------------------------------------
+6) Filtrado banda y descomposición modal (SSA/EMD)
+---------------------------------------------------------------
+Parámetros recomendados:
+- muestreo: mensual para señales > 2 años; si tienes series diarias o 1-min, promediar a diario mensual o 5-días según objetivo.
+- bandpass 2-10 años: Butterworth orden 4 (zero-phase filtrado con filtfilt)
+
+# Filtro Butterworth (ejemplo con datos mensuales)
+from scipy.signal import butter, filtfilt
+fs = 12.0  # muestras/año
+low = 1/10.0
+high = 1/2.0
+b, a = butter(4, [low/(0.5*fs), high/(0.5*fs)], btype='band')
+filtered = filtfilt(b, a, series.values)
+
+# SSA (pyssa / own implementation)
+from pyssa import SSA
+s = SSA(series.values)
+L = int(0.4 * len(series))
+s.decompose(L=L)
+# elegir componentes que expliquen energía en banda objetivo
+reconstruction = s.reconstruct(components=[...])
+
+Guardar componentes: data/processed/filtered/
+
+---------------------------------------------------------------
+7) Coherencia espacial y cálculo de SNR
+---------------------------------------------------------------
+Objetivo: calcular coherencia espectral entre pares (Welch) y densidad espectral cruzada
+
+from scipy.signal import coherence, welch, csd
+
+# ejemplo: calcular coherencia entre estación i y j
+f, Cxy = coherence(series_i, series_j, fs=fs, nperseg=segment)
+
+# calcular potencia por banda
+def band_power(f, Pxx, fmin, fmax):
+    mask = (f>=fmin) & (f<=fmax)
+    return np.trapz(Pxx[mask], f[mask])
+
+# SNR: ratio entre potencia de señal (en banda objetivo) y potencia estimada de ruido (ej. bandas contiguas o modelo 1/f)
+
+---------------------------------------------------------------
+8) Bootstrap y pruebas de significación
+---------------------------------------------------------------
+Estrategia:
+- ajustar modelo de ruido 1/f a la PSD observed (fit slope)
+- generar N realizaciones de ruido con esa PSD
+- procesar cada realización con el mismo pipeline (filter, SSA, coherencia)
+- obtener distribución de SNR y calcular p-valor
+
+# pseudocódigo
+N = 1000
+snr_null = []
+for k in range(N):
+    noise = generate_1overf_noise(len(series), alpha=alpha_est)
+    noise_filtered = filtfilt(b,a, noise)
+    snr_k = compute_snr(noise_filtered, ...)  # mismo procedimiento
+    snr_null.append(snr_k)
+
+p_value = np.mean(np.array(snr_null) >= snr_observed)
+
+Funciones auxiliares: generate_1overf_noise (uso de método circulant embedding o síntesis en freq-domain)
+
+---------------------------------------------------------------
+9) Inversión forward 1D (estimación de amplitud núcleo->superficie)
+---------------------------------------------------------------
+Objetivo: dada una amplitud observada en superficie A_s, estimar amplitud en superficie del núcleo A_c plausible, usando modelo simplificado:
+A_s = A_c * (r_c / r_e)^{l+2} * exp(-d / delta(omega))
+
+Resolver para A_c:
+A_c = A_s / [ (r_c/r_e)^{l+2} * exp(-d/delta) ]
+
+Donde delta(omega) = sqrt(2 / (mu0 * sigma * omega))
+
+# pseudocódigo
+import numpy as np
+mu0 = 4*np.pi*1e-7
+omega = 2*np.pi / (T_seconds)
+sigma = 1e-2  # ejemplo
+delta = np.sqrt(2.0 / (mu0 * sigma * omega))
+q = (r_c / r_e)**(l+2)
+A_c = A_s / (q * np.exp(-d / delta))
+
+Comparar A_c con límites físicos razonables (e.g., 0.1 - 10 nT) para plausibilidad.
+
+---------------------------------------------------------------
+10) Integración con MT y validación multimodal
+---------------------------------------------------------------
+- Procesar series MT de estaciones cercanas: obtener impedancia Z(f) y conductividad aparente.
+- Buscar coherencia temporal entre amplitude de la banda modal en geomagnetismo y cambios en parámetros MT a frecuencias bajas.
+- Si MT muestra respuesta consistente, añadir evidencia de transmisión inductiva por manto.
+
+# pseudocódigo conceptual
+mt_Z = load_mt_station('station_code')
+# calcular Z(f) en freqs bajas (f~1/(4-8yr)) -> requiere integracion de registros largos
+# interpretar cambios en |Z| o fase
+
+Nota: los datos MT a décadas de periodo pueden ser escasos; muchas veces se usan respuestas MT a periodos menores para inferir conductividad profunda y extrapolar.
+
+---------------------------------------------------------------
+11) Salida, reproducibilidad y control de versiones
+---------------------------------------------------------------
+Elementos a guardar:
+- scripts/pipelines (versionados en Git)
+- env.yml o conda env export
+- metadata/data_manifest.yaml (queries, checksum, versiones)
+- resultados (figuras, tablas, csv): results/
+- notebook con pasos ejecutables
+
+Ejemplo de commit message y tag:
+git add .
+git commit -m "Pipeline inicial: descarga Swarm, GVO, filtro 2-10yr, SSA, bootstrap"
+git tag -a v0.1 -m "Pipeline reproducible versión 0.1"
+
+---------------------------------------------------------------
+Apéndice: funciones auxiliares recomendadas (pseudocódigo)
+---------------------------------------------------------------
+# 1: generar ruido 1/f en dominio de frecuencia
+import numpy as np
+
+def generate_1overf_noise(N, alpha=1.0, fs=1.0, seed=None):
+    # alpha ~ slope of 1/f^alpha
+    rng = np.random.RandomState(seed)
+    # generate frequency array
+    freqs = np.fft.rfftfreq(N, d=1.0/fs)
+    # avoid f=0
+    S = np.where(freqs==0, 0.0, 1.0 / (freqs**alpha))
+    phases = rng.uniform(0, 2*np.pi, len(freqs))
+    spectral = np.sqrt(S) * np.exp(1j*phases)
+    time_series = np.fft.irfft(spectral, n=N)
+    # normalize
+    time_series = (time_series - np.mean(time_series)) / np.std(time_series)
+    return time_series
+
+# 2: computar SNR en banda
+from scipy.signal import welch
+
+def compute_snr(series, fs, fmin, fmax, noise_model_band=None):
+    f, Pxx = welch(series, fs=fs, nperseg=int(fs*256))
+    signal_power = band_power(f, Pxx, fmin, fmax)
+    if noise_model_band is None:
+        # noise estimated como promedio de bandas adyacentes
+        noise_power = band_power(f, Pxx, fmin*0.5, fmin*0.9) + band_power(f, Pxx, fmax*1.1, fmax*2.0)
+    else:
+        noise_power = estimate_noise_from_model(f, Pxx, noise_model_band)
+    return signal_power / noise_power
+
+# 3: band_power
+import numpy as np
+
+def band_power(f, Pxx, fmin, fmax):
+    mask = (f>=fmin) & (f<=fmax)
+    if not np.any(mask):
+        return 0.0
+    return np.trapz(Pxx[mask], f[mask])
+
+---------------------------------------------------------------
+Notas finales y consideraciones prácticas
+---------------------------------------------------------------
+- Tiempo de cómputo: el paso de bootstrap es el más costoso; paralelizar N realizaciones con joblib o cluster.
+- Datos largos (décadas) requieren buen manejo de memoria (usar xarray / dask si necesario).
+- Documentar versiones de productos satélite y modelos geomagnéticos usados (CHAOS, Swarm L1b version, etc.).
+- Mantener registros de filtrado (filtros y órdenes) para reproducibilidad.
+
+Fin del apéndice metodológico.
+"""
